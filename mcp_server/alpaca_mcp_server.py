@@ -4,7 +4,8 @@ Alpaca Markets paper-trading MCP server.
 Exposes paper-trading tools over MCP (Model Context Protocol) so a
 Databricks Agent Bricks agent can call them like any other tool:
     - get_quote(symbol)
-    - place_trade(account_id, symbol, side, quantity)
+    - stage_trade(symbol, side, quantity)
+    - execute_trade(account_id, symbol, side, quantity, confirmation_code)
     - get_positions(account_id)
     - get_account_summary(account_id)
     - get_order_history(account_id, limit)
@@ -36,7 +37,9 @@ Run locally:
 
 import os
 import logging
+import random
 from contextvars import ContextVar
+from datetime import datetime
 
 from fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
@@ -69,6 +72,9 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-M
 
 # Context variable to store request headers for accessing end-user identity
 _request_context: ContextVar[dict] = ContextVar('request_context', default={})
+
+# In-memory storage for staged trades awaiting confirmation
+_staged_trades: dict[str, dict] = {}
 
 
 def _get_end_user_email() -> str:
@@ -116,10 +122,70 @@ def get_quote(symbol: str) -> dict:
 
 
 @mcp.tool
-def place_trade(account_id: str, symbol: str, side: str, quantity: float) -> dict:
+def stage_trade(symbol: str, side: str, quantity: float) -> dict:
     """
-    Place a real market order (paper trade) - BUY or SELL - against the
-    configured Alpaca paper trading account.
+    Stage a trade for review before execution. Looks up the current price,
+    calculates the estimated cost, and generates a 5-digit confirmation code.
+    
+    Use this to preview a trade before executing it. Once reviewed, call
+    execute_trade with the confirmation code to complete the trade.
+
+    Args:
+        symbol: Stock ticker symbol, e.g. "AAPL".
+        side: "BUY" or "SELL".
+        quantity: Number of shares to trade (must be positive).
+
+    Returns:
+        A dict with the trade summary (symbol, side, quantity, current_price,
+        estimated_cost) and a confirmation_code to execute the trade.
+    """
+    try:
+        # Get current quote
+        quote = massive_broker.get_quote(symbol)
+        price = quote["price"]
+        
+        # Calculate estimated cost
+        estimated_cost = price * quantity
+        
+        # Generate 5-digit confirmation code
+        confirmation_code = f"{random.randint(10000, 99999)}"
+        
+        # Store staged trade
+        _staged_trades[confirmation_code] = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "quantity": quantity,
+            "price": price,
+            "estimated_cost": estimated_cost,
+            "staged_at": datetime.utcnow().isoformat(),
+        }
+        
+        return {
+            "status": "staged",
+            "message": f"Trade staged for review. Use confirmation code to execute.",
+            "confirmation_code": confirmation_code,
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "quantity": quantity,
+            "current_price": price,
+            "estimated_cost": estimated_cost,
+            "quote_details": quote,
+        }
+    except Exception as e:
+        logger.exception(f"Failed to stage trade for {symbol}")
+        return {
+            "status": "error",
+            "message": f"Failed to stage trade: {str(e)}",
+        }
+
+
+@mcp.tool
+def execute_trade(account_id: str, symbol: str, side: str, quantity: float, confirmation_code: str) -> dict:
+    """
+    Execute a previously staged trade using the 5-digit confirmation code.
+    
+    This places a real market order (paper trade) against the Alpaca paper
+    trading account. You must first call stage_trade to get a confirmation code.
 
     Args:
         account_id: Accepted for signature compatibility; not used to
@@ -128,12 +194,47 @@ def place_trade(account_id: str, symbol: str, side: str, quantity: float) -> dic
         symbol: Stock ticker symbol, e.g. "AAPL".
         side: "BUY" or "SELL".
         quantity: Number of shares to trade (must be positive).
+        confirmation_code: 5-digit code from stage_trade.
 
     Returns:
-        A dict describing the order (id, symbol, side, quantity,
+        A dict describing the executed order (id, symbol, side, quantity,
         price, notional, status, created_at).
     """
-    return alpaca_broker.place_order(account_id, symbol, side, quantity)
+    try:
+        # Verify confirmation code exists
+        if confirmation_code not in _staged_trades:
+            return {
+                "status": "error",
+                "message": "Invalid or expired confirmation code. Please stage the trade first using stage_trade.",
+            }
+        
+        # Retrieve and validate staged trade
+        staged = _staged_trades[confirmation_code]
+        
+        # Verify parameters match the staged trade
+        if (staged["symbol"] != symbol.upper() or 
+            staged["side"] != side.upper() or 
+            staged["quantity"] != quantity):
+            return {
+                "status": "error",
+                "message": "Trade parameters do not match staged trade. Please verify symbol, side, and quantity.",
+                "staged_trade": staged,
+            }
+        
+        # Execute the trade
+        result = alpaca_broker.place_order(account_id, symbol, side, quantity)
+        
+        # Remove staged trade after execution
+        del _staged_trades[confirmation_code]
+        
+        return result
+        
+    except Exception as e:
+        logger.exception(f"Failed to execute trade for {symbol}")
+        return {
+            "status": "error",
+            "message": f"Failed to execute trade: {str(e)}",
+        }
 
 
 @mcp.tool
