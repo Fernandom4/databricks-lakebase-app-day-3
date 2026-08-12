@@ -38,8 +38,13 @@ Run locally:
 import os
 import logging
 import random
+import uuid
+import time
+import json
 from contextvars import ContextVar
 from datetime import datetime
+from functools import wraps
+from typing import Callable, Any
 
 from fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
@@ -73,6 +78,9 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-M
 # Context variable to store request headers for accessing end-user identity
 _request_context: ContextVar[dict] = ContextVar('request_context', default={})
 
+# Context variable to store unique session ID for each agent session
+_session_id: ContextVar[str] = ContextVar('session_id', default=None)
+
 # In-memory storage for staged trades awaiting confirmation
 _staged_trades: dict[str, dict] = {}
 
@@ -91,11 +99,158 @@ def _get_end_user_email() -> str:
     return w.current_user.me().user_name or 'f.marquezr96@gmail.com'
 
 
+def _get_or_create_session_id() -> str:
+    """Get or create a unique session ID for the current agent session."""
+    session_id = _session_id.get()
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+        _session_id.set(session_id)
+        logger.info(f"Created new session ID: {session_id}")
+    return session_id
+
+
+def _log_trace_to_db(
+    trace_id: str,
+    session_id: str,
+    tool_name: str,
+    user_email: str,
+    request_params: dict,
+    response_data: Any,
+    status: str,
+    error_message: str | None,
+    duration_ms: float,
+    started_at: datetime,
+    completed_at: datetime,
+) -> None:
+    """Log a trace record to the Lakebase mcp_traces table."""
+    try:
+        sql = """
+        INSERT INTO mcp_traces (
+            trace_id, session_id, tool_name, user_email, request_params,
+            response_data, status, error_message, duration_ms, started_at, completed_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        # Convert objects to JSON strings for JSONB columns
+        request_json = json.dumps(request_params)
+        response_json = json.dumps(response_data) if response_data else None
+        
+        lakebase.run_write(
+            sql,
+            (
+                trace_id,
+                session_id,
+                tool_name,
+                user_email,
+                request_json,
+                response_json,
+                status,
+                error_message,
+                duration_ms,
+                started_at,
+                completed_at,
+            ),
+        )
+        logger.debug(f"Logged trace {trace_id} for {tool_name}")
+    except Exception as e:
+        # Don't fail the tool call if logging fails
+        logger.exception(f"Failed to log trace for {tool_name}: {e}")
+
+
+def trace_mcp_call(func: Callable) -> Callable:
+    """Decorator to add MLflow tracing and Lakebase logging to MCP tool calls."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Generate unique trace ID and get session ID
+        trace_id = str(uuid.uuid4())
+        session_id = _get_or_create_session_id()
+        user_email = _get_end_user_email()
+        tool_name = func.__name__
+        
+        # Record start time
+        started_at = datetime.utcnow()
+        start_time = time.time()
+        
+        # Capture request parameters
+        request_params = {
+            'args': args,
+            'kwargs': kwargs,
+        }
+        
+        # Start MLflow trace
+        with mlflow.start_span(name=tool_name) as span:
+            span.set_attribute("trace_id", trace_id)
+            span.set_attribute("session_id", session_id)
+            span.set_attribute("user_email", user_email)
+            span.set_attribute("tool_name", tool_name)
+            
+            try:
+                # Execute the tool
+                result = func(*args, **kwargs)
+                
+                # Record completion
+                completed_at = datetime.utcnow()
+                duration_ms = (time.time() - start_time) * 1000
+                
+                # Log to MLflow
+                span.set_attribute("status", "success")
+                span.set_attribute("duration_ms", duration_ms)
+                
+                # Log to Lakebase
+                _log_trace_to_db(
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    user_email=user_email,
+                    request_params=request_params,
+                    response_data=result,
+                    status="success",
+                    error_message=None,
+                    duration_ms=duration_ms,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                )
+                
+                return result
+                
+            except Exception as e:
+                # Record error
+                completed_at = datetime.utcnow()
+                duration_ms = (time.time() - start_time) * 1000
+                error_message = str(e)
+                
+                # Log to MLflow
+                span.set_attribute("status", "error")
+                span.set_attribute("error", error_message)
+                span.set_attribute("duration_ms", duration_ms)
+                
+                # Log to Lakebase
+                _log_trace_to_db(
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    user_email=user_email,
+                    request_params=request_params,
+                    response_data=None,
+                    status="error",
+                    error_message=error_message,
+                    duration_ms=duration_ms,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                )
+                
+                # Re-raise the exception
+                raise
+    
+    return wrapper
+
+
 mcp = FastMCP("alpaca-paper-trading")
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Middleware to capture HTTP headers containing end-user identity."""
+    """Middleware to capture HTTP headers containing end-user identity and manage session IDs."""
     async def dispatch(self, request: Request, call_next):
         # Capture headers that Databricks injects with user identity
         headers = {
@@ -103,11 +258,22 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             'x-forwarded-email': request.headers.get('x-forwarded-email'),
         }
         _request_context.set(headers)
+        
+        # Check for existing session ID in header, or create a new one
+        session_id = request.headers.get('x-session-id')
+        if not session_id:
+            session_id = str(uuid.uuid4())
+            logger.info(f"Created new session ID: {session_id}")
+        _session_id.set(session_id)
+        
         response = await call_next(request)
+        # Return session ID in response header so client can reuse it
+        response.headers['x-session-id'] = session_id
         return response
 
 
 @mcp.tool
+@trace_mcp_call
 def get_quote(symbol: str) -> dict:
     """
     Get the latest real quote for a stock ticker symbol from Massive.com.
@@ -122,6 +288,7 @@ def get_quote(symbol: str) -> dict:
 
 
 @mcp.tool
+@trace_mcp_call
 def stage_trade(symbol: str, side: str, quantity: float) -> dict:
     """
     Stage a trade for review before execution. Looks up the current price,
@@ -180,6 +347,7 @@ def stage_trade(symbol: str, side: str, quantity: float) -> dict:
 
 
 @mcp.tool
+@trace_mcp_call
 def execute_trade(account_id: str, symbol: str, side: str, quantity: float, confirmation_code: str) -> dict:
     """
     Execute a previously staged trade using the 5-digit confirmation code.
@@ -238,6 +406,7 @@ def execute_trade(account_id: str, symbol: str, side: str, quantity: float, conf
 
 
 @mcp.tool
+@trace_mcp_call
 def get_positions(account_id: str) -> list[dict]:
     """
     Get all open positions for the Alpaca paper trading account.
@@ -253,6 +422,7 @@ def get_positions(account_id: str) -> list[dict]:
 
 
 @mcp.tool
+@trace_mcp_call
 def get_account_summary(account_id: str) -> dict:
     """
     Get a full account summary for the Alpaca paper trading account: cash
@@ -404,6 +574,7 @@ def add_to_watchlist(symbol: str, email: str = 'f.marquezr96@gmail.com') -> dict
 
 
 @mcp.tool
+@trace_mcp_call
 def get_watchlist(limit: int = 100, email: str = 'f.marquezr96@gmail.com') -> dict:
     """
     Retrieve all stocks in the authenticated user's watchlist from Lakebase.
